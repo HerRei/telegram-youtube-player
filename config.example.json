@@ -1,0 +1,12 @@
+{
+  "bot_token": "123456789:replace-with-botfather-token",
+  "allowed_chat_id": 123456789,
+  "allowed_user_id": 123456789,
+  "target_monitor_product": "Detected monitor name",
+  "target_monitor_connector": "Detected connector or display number",
+  "browser_type": "firefox",
+  "browser_path": "Path to the browser executable",
+  "ollama_api_key": "replace-with-ollama-web-search-api-key",
+  "ollama_model": "qwen3:0.6b-q4_K_M",
+  "find_link_script": "bundled"
+}

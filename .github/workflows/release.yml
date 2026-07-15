@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            runner: ubuntu-22.04
+            package: linux
+          - name: Windows x86-64
+            runner: windows-latest
+            package: windows
+          - name: macOS Apple Silicon
+            runner: macos-15
+            package: macos-arm64
+          - name: macOS Intel
+            runner: macos-15-intel
+            package: macos-x86_64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Test
+        run: |
+          python -m py_compile player.py platform_support.py setup_ui.py link_search.py
+          python -m unittest discover -s tests -v
+          python player.py smoke-test
+
+      - name: Build setup application
+        run: |
+          python -m pip install pyinstaller==6.14.2
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name TelegramYouTubePlayer player.py
+
+      - name: Test Linux application
+        if: matrix.package == 'linux'
+        run: ./dist/TelegramYouTubePlayer smoke-test
+
+      - name: Package Linux downloads
+        if: matrix.package == 'linux'
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p release package/DEBIAN package/usr/bin package/usr/share/applications
+          install -m 755 dist/TelegramYouTubePlayer release/TelegramYouTubePlayer-Setup-Linux-x86_64
+          install -m 755 dist/TelegramYouTubePlayer package/usr/bin/telegram-youtube-player
+          cat > package/DEBIAN/control <<EOF
+          Package: telegram-youtube-player
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Depends: libc6 (>= 2.35), libx11-6
+          Maintainer: HerRei
+          Description: Telegram-controlled fullscreen browser player
+          EOF
+          cat > package/usr/share/applications/telegram-youtube-player.desktop <<EOF
+          [Desktop Entry]
+          Name=Telegram YouTube Player
+          Comment=Set up Telegram-controlled browser playback
+          Exec=/usr/bin/telegram-youtube-player
+          Icon=video-display
+          Terminal=false
+          Type=Application
+          Categories=AudioVideo;Utility;
+          EOF
+          dpkg-deb --build --root-owner-group package "release/TelegramYouTubePlayer-Setup-Linux-x86_64.deb"
+
+      - name: Test Windows application
+        if: matrix.package == 'windows'
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath "dist/TelegramYouTubePlayer.exe" -ArgumentList "smoke-test" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { exit $process.ExitCode }
+
+      - name: Package Windows download
+        if: matrix.package == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release
+          Copy-Item dist/TelegramYouTubePlayer.exe release/TelegramYouTubePlayer-Setup-Windows-x86_64.exe
+
+      - name: Test macOS application
+        if: startsWith(matrix.package, 'macos-')
+        run: ./dist/TelegramYouTubePlayer.app/Contents/MacOS/TelegramYouTubePlayer smoke-test
+
+      - name: Package macOS download
+        if: startsWith(matrix.package, 'macos-')
+        shell: bash
+        run: |
+          codesign --force --deep --sign - dist/TelegramYouTubePlayer.app
+          mkdir -p release/dmg-root
+          cp -R dist/TelegramYouTubePlayer.app release/dmg-root/
+          hdiutil create -quiet -volname "Telegram YouTube Player" -srcfolder release/dmg-root -ov -format UDZO "release/TelegramYouTubePlayer-Setup-${{ matrix.package }}.dmg"
+          rm -rf release/dmg-root
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.package }}
+          path: release/
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Create checksums
+        run: |
+          cd release
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release/* --verify-tag --title "Telegram YouTube Player $GITHUB_REF_NAME" --notes-file .github/release-notes.md
