@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -154,7 +155,8 @@ class DesktopShortcutTests(unittest.TestCase):
             self.assertEqual(shortcut, result)
             self.assertIn('Exec="/opt/player" "setup"', contents)
             self.assertIn("Terminal=false", contents)
-            self.assertTrue(shortcut.stat().st_mode & 0o100)
+            if os.name != "nt":
+                self.assertTrue(shortcut.stat().st_mode & 0o100)
 
     def test_windows_shortcut_script(self):
         script = native.windows_shortcut_script(
@@ -175,7 +177,7 @@ class DesktopShortcutTests(unittest.TestCase):
             with mock.patch("platform_support.desktop_shortcut_paths", return_value=paths):
                 shortcut = native.install_desktop_shortcut([str(executable)], "Darwin")
             self.assertTrue(shortcut.is_symlink())
-            self.assertEqual(root / "Player.app", shortcut.resolve())
+            self.assertTrue(shortcut.samefile(root / "Player.app"))
 
 
 class HostSmokeTests(unittest.TestCase):

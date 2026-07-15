@@ -428,12 +428,13 @@ class LinkFinderTests(unittest.TestCase):
     def test_pulls_configured_model_when_missing(self):
         listed = subprocess.CompletedProcess([], 0, stdout="NAME ID SIZE MODIFIED\nother:latest 1 1 GB now\n", stderr="")
         pulled = subprocess.CompletedProcess([], 0, stdout="", stderr="")
-        with mock.patch("player.shutil.which", return_value="/usr/bin/ollama"), mock.patch(
+        ollama = str(Path("/usr/bin/ollama"))
+        with mock.patch("player.shutil.which", return_value=ollama), mock.patch(
             "player.subprocess.run", side_effect=[listed, pulled]
         ) as run, mock.patch("builtins.print"):
             player.ensure_ollama_model("qwen3:0.6b-q4_K_M", pull_if_missing=True)
         self.assertEqual(
-            ["/usr/bin/ollama", "pull", "qwen3:0.6b-q4_K_M"],
+            [ollama, "pull", "qwen3:0.6b-q4_K_M"],
             run.call_args_list[1].args[0],
         )
 
