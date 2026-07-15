@@ -15,7 +15,6 @@ Minimum hardware:
 - 64-bit x86-64 or ARM64 CPU with 2 logical cores.
 - 4 GB RAM; 8 GB is recommended for high-resolution playback.
 - 2 GB of free disk space in addition to the browser.
-- A graphics adapter that can drive the selected monitor.
 
 ## Setup
 
