@@ -551,6 +551,20 @@ class PlaybackQueue:
             self._save()
             return previous, self.current
 
+    def skip_to_last(self) -> tuple[QueueItem | None, QueueItem | None, int]:
+        with self.lock:
+            if self.current is None:
+                return None, None, 0
+            if not self.pending:
+                return self.current, self.current, 0
+            previous = self.current
+            skipped = len(self.pending)
+            self.current = self.pending[-1]
+            self.pending.clear()
+            self.revision += 1
+            self._save()
+            return previous, self.current, skipped
+
     def clear_pending(self) -> int:
         with self.lock:
             count = len(self.pending)
@@ -871,27 +885,33 @@ def validate_ollama_model_name(model: str) -> str:
     return model
 
 
+def ollama_executable(system: str | None = None) -> Path | None:
+    system = native.host_system(system)
+    command = shutil.which("ollama")
+    if command:
+        return Path(command)
+    if system == "Windows":
+        local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
+        candidates = (local / "Programs/Ollama/ollama.exe", Path("C:/Program Files/Ollama/ollama.exe"))
+    elif system == "Darwin":
+        candidates = (
+            Path("/opt/homebrew/bin/ollama"),
+            Path("/usr/local/bin/ollama"),
+            Path("/Applications/Ollama.app/Contents/Resources/ollama"),
+        )
+    else:
+        candidates = (Path("/usr/local/bin/ollama"), Path("/usr/bin/ollama"))
+    return next((path for path in candidates if path.is_file()), None)
+
+
 def ensure_ollama_model(model: str, pull_if_missing: bool = False) -> None:
     model = validate_ollama_model_name(model)
-    ollama = shutil.which("ollama")
-    if not ollama:
-        if platform.system() == "Windows":
-            local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
-            candidates = (local / "Programs/Ollama/ollama.exe", Path("C:/Program Files/Ollama/ollama.exe"))
-        elif platform.system() == "Darwin":
-            candidates = (
-                Path("/opt/homebrew/bin/ollama"),
-                Path("/usr/local/bin/ollama"),
-                Path("/Applications/Ollama.app/Contents/Resources/ollama"),
-            )
-        else:
-            candidates = (Path("/usr/local/bin/ollama"), Path("/usr/bin/ollama"))
-        ollama = next((str(path) for path in candidates if path.is_file()), None)
+    ollama = ollama_executable()
     if not ollama:
         raise RuntimeError("Ollama is not installed or is not on PATH")
     try:
         result = subprocess.run(
-            [ollama, "list"],
+            [str(ollama), "list"],
             check=True,
             capture_output=True,
             text=True,
@@ -901,7 +921,7 @@ def ensure_ollama_model(model: str, pull_if_missing: bool = False) -> None:
         raise RuntimeError("Could not connect to the local Ollama service") from error
     installed = {
         line.split()[0]
-        for line in result.stdout.splitlines()[1:]
+        for line in (result.stdout or "").splitlines()[1:]
         if line.split()
     }
     if model in installed:
@@ -910,7 +930,7 @@ def ensure_ollama_model(model: str, pull_if_missing: bool = False) -> None:
         raise RuntimeError(f"Ollama model {model} is not installed")
     print(f"Downloading Ollama model {model}...")
     try:
-        subprocess.run([ollama, "pull", model], check=True, timeout=1800)
+        subprocess.run([str(ollama), "pull", model], check=True, timeout=1800)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         raise RuntimeError(f"Could not download Ollama model {model}") from error
 
@@ -1432,7 +1452,7 @@ def run_bot() -> None:
                     api.send_message(
                         chat_id,
                         f"Send a YouTube link or describe a page to open on {config.target_monitor_product}. "
-                        "Commands: /queue, /skip, /clear, /status, /stop",
+                        "Commands: /queue, /skip, /skipall, /clear, /status, /stop",
                     )
                     continue
                 if command == "/stop":
@@ -1452,6 +1472,17 @@ def run_bot() -> None:
                         api.send_message(chat_id, f"Skipping to {queue_item_text(asdict(next_item))}.")
                     else:
                         api.send_message(chat_id, "Skipped. Queue is empty.")
+                    continue
+                if command == "/skipall":
+                    previous, last_item, skipped = queue.skip_to_last()
+                    if not previous:
+                        api.send_message(chat_id, "Queue is empty.")
+                    else:
+                        ensure_queue_player(player, playback_server)
+                        if skipped:
+                            api.send_message(chat_id, f"Skipped {skipped} items to {queue_item_text(asdict(last_item))}.")
+                        else:
+                            api.send_message(chat_id, "Already playing the last queue item.")
                     continue
                 if command == "/clear":
                     removed = queue.clear_pending()
@@ -1796,7 +1827,17 @@ def queue_smoke_test() -> dict[str, Any]:
         restored = PlaybackQueue(queue_path).snapshot()
         if restored["current"]["media_id"] != "second456":
             raise RuntimeError("Queue persistence test failed")
-        return {"queue": "ok", "player_api": "ok", "persistence": "ok"}
+        queue = PlaybackQueue(queue_path)
+        queue.enqueue(
+            [
+                youtube_queue_item("https://youtu.be/third789"),
+                youtube_queue_item("https://youtu.be/final012"),
+            ]
+        )
+        _, last_item, skipped = queue.skip_to_last()
+        if skipped != 2 or last_item is None or last_item.media_id != "final012" or queue.snapshot()["pending"]:
+            raise RuntimeError("Skip-all test failed")
+        return {"queue": "ok", "player_api": "ok", "persistence": "ok", "skip_all": "ok"}
 
 
 def parse_arguments() -> argparse.Namespace:

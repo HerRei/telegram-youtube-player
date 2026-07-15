@@ -6,9 +6,9 @@ A Telegram bot that opens YouTube links or search results fullscreen on a select
 
 - Python 3.11 or a packaged release.
 - Firefox, Chromium, Google Chrome, or Brave.
-- [Ollama](https://ollama.com/download) with `qwen3:0.6b-q4_K_M`.
+- [Ollama](https://ollama.com/download) with `qwen3:0.6b-q4_K_M`. The setup links to the download if Ollama is missing.
 - A Telegram bot token from [@BotFather](https://t.me/BotFather).
-- An [Ollama API key](https://ollama.com/settings/keys) for web search.
+- An [Ollama API key](https://ollama.com/settings/keys) for web search. See the [official guide](https://docs.ollama.com/capabilities/web-search).
 
 Minimum hardware:
 
@@ -25,7 +25,7 @@ Download the installer for your operating system from the [latest release](https
 - Other x86-64 Linux: portable executable
 - macOS: `.dmg` for Apple Silicon or Intel
 
-Open the installer, send `/start` to the bot, and use **Detect from /start**. Select a browser and monitor, then choose **Install and start**.
+Open the installer, send `/start` to the bot, and use **Detect from /start**. The setup provides Ollama download and API-key links. Select a browser and monitor, choose whether to create a desktop shortcut and start the app when you sign in, then select **Install and start**.
 
 From source:
 
@@ -35,7 +35,7 @@ cd telegram-youtube-player
 python player.py
 ```
 
-The installer detects active monitors and supported browsers, downloads the Ollama model if needed, and adds the app to startup:
+The installer detects active monitors and supported browsers and downloads the Ollama model if needed. Startup is optional:
 
 - Linux: systemd user service.
 - Windows: user Startup folder.
@@ -61,6 +61,7 @@ Send one or more YouTube links or describe a page to find. New YouTube links are
 ```text
 /queue   Show the current video and waiting items.
 /skip    Play the next item.
+/skipall Skip directly to the final item in the queue.
 /clear   Remove waiting items but keep the current video.
 /status  Show the browser, monitor, and queue size.
 /stop    Close playback and clear the queue.

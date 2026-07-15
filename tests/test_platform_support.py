@@ -1,6 +1,9 @@
 import json
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import platform_support as native
 
@@ -88,6 +91,18 @@ class BrowserTests(unittest.TestCase):
                 self.assertNotIn("--ozone-platform=x11", chromium_command)
 
 
+class ProcessTests(unittest.TestCase):
+    def test_windows_missing_process_output_is_not_running(self):
+        completed = subprocess.CompletedProcess([], 0, stdout=None, stderr=None)
+        with mock.patch("platform_support.subprocess.run", return_value=completed):
+            self.assertFalse(native.valid_saved_process(1234, Path("profile"), system="Windows"))
+
+    def test_macos_missing_process_output_is_not_running(self):
+        completed = subprocess.CompletedProcess([], 0, stdout=None, stderr=None)
+        with mock.patch("platform_support.subprocess.run", return_value=completed):
+            self.assertFalse(native.valid_saved_process(1234, Path("profile"), system="Darwin"))
+
+
 class StartupTests(unittest.TestCase):
     def test_linux_service(self):
         service = native.linux_service_contents(["/usr/bin/python3", "/tmp/player.py", "run"], ":1")
@@ -104,6 +119,63 @@ class StartupTests(unittest.TestCase):
         self.assertEqual("com.herrei.telegram-youtube-player", payload["Label"])
         self.assertTrue(payload["RunAtLoad"])
         self.assertEqual("run", payload["ProgramArguments"][-1])
+
+    def test_removes_windows_startup_item(self):
+        with tempfile.TemporaryDirectory() as directory:
+            startup = Path(directory) / "telegram-youtube-player.cmd"
+            startup.write_text("start player")
+            self.assertTrue(native.remove_autostart(startup, "Windows"))
+            self.assertFalse(startup.exists())
+
+
+class DesktopShortcutTests(unittest.TestCase):
+    def test_platform_shortcut_locations(self):
+        home = Path("/users/test")
+        self.assertEqual(
+            home / "Desktop/Telegram YouTube Player.desktop",
+            native.desktop_shortcut_paths("Linux", home, {})[0],
+        )
+        self.assertEqual(
+            home / "Desktop/Telegram YouTube Player.lnk",
+            native.desktop_shortcut_paths("Windows", home, {"USERPROFILE": str(home)})[0],
+        )
+        self.assertEqual(
+            home / "Desktop/Telegram YouTube Player.app",
+            native.desktop_shortcut_paths("Darwin", home, {})[0],
+        )
+
+    def test_linux_desktop_shortcut(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shortcut = root / "Desktop/Telegram YouTube Player.desktop"
+            with mock.patch("platform_support.desktop_shortcut_paths", return_value=(shortcut,)):
+                result = native.install_desktop_shortcut(["/opt/player", "setup"], "Linux")
+            contents = shortcut.read_text()
+            self.assertEqual(shortcut, result)
+            self.assertIn('Exec="/opt/player" "setup"', contents)
+            self.assertIn("Terminal=false", contents)
+            self.assertTrue(shortcut.stat().st_mode & 0o100)
+
+    def test_windows_shortcut_script(self):
+        script = native.windows_shortcut_script(
+            Path("C:/Users/Test/Desktop/Telegram YouTube Player.lnk"),
+            ["C:/Program Files/Player/player.exe", "setup"],
+        )
+        self.assertIn("WScript.Shell", script)
+        self.assertIn("player.exe", script)
+        self.assertIn("$shortcut.Save()", script)
+
+    def test_macos_desktop_shortcut_links_application(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "Player.app/Contents/MacOS/Player"
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            paths = (root / "Desktop/Telegram YouTube Player.app", root / "Desktop/Telegram YouTube Player.command")
+            with mock.patch("platform_support.desktop_shortcut_paths", return_value=paths):
+                shortcut = native.install_desktop_shortcut([str(executable)], "Darwin")
+            self.assertTrue(shortcut.is_symlink())
+            self.assertEqual(root / "Player.app", shortcut.resolve())
 
 
 class HostSmokeTests(unittest.TestCase):

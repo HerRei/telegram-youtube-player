@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import tkinter as tk
+import webbrowser
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
@@ -14,14 +15,42 @@ import player
 
 
 T = TypeVar("T")
+OLLAMA_DOWNLOAD_URL = "https://ollama.com/download"
+OLLAMA_WEB_SEARCH_GUIDE_URL = "https://docs.ollama.com/capabilities/web-search"
+OLLAMA_KEYS_URL = "https://ollama.com/settings/keys"
+
+
+def open_external_url(url: str) -> None:
+    if not webbrowser.open(url, new=2):
+        raise RuntimeError(f"Could not open {url}")
+
+
+def apply_launch_options(
+    command: list[str],
+    start_at_login: bool,
+    desktop_icon: bool,
+    service_file: Path,
+) -> tuple[Path | None, Path | None]:
+    if desktop_icon:
+        shortcut = native.install_desktop_shortcut(command[:-1])
+    else:
+        native.remove_desktop_shortcut()
+        shortcut = None
+    if start_at_login:
+        startup_file = native.install_autostart(command, service_file)
+    else:
+        native.remove_autostart(service_file)
+        native.start_application(command)
+        startup_file = None
+    return startup_file, shortcut
 
 
 class SetupWindow:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("Telegram YouTube Player Setup")
-        self.root.geometry("700x630")
-        self.root.minsize(640, 560)
+        self.root.geometry("720x730")
+        self.root.minsize(660, 680)
         self.current = self._current_config()
         self.monitors: list[native.Monitor] = []
         self.browsers: list[native.DetectedBrowser] = []
@@ -36,6 +65,8 @@ class SetupWindow:
         self.browser_path = tk.StringVar(value=self.current.browser_path if self.current else "")
         self.api_key = tk.StringVar(value=self.current.ollama_api_key if self.current else "")
         self.model = tk.StringVar(value=self.current.ollama_model if self.current else player.DEFAULT_OLLAMA_MODEL)
+        self.start_at_login = tk.BooleanVar(value=native.autostart_installed() if self.current else True)
+        self.desktop_icon = tk.BooleanVar(value=native.desktop_shortcut_installed() if self.current else True)
         self.status = tk.StringVar(value="Detecting monitors and browsers...")
 
         self._build()
@@ -85,17 +116,46 @@ class SetupWindow:
         ttk.Separator(body).grid(row=8, column=0, columnspan=3, sticky="ew", pady=14)
 
         ttk.Label(body, text="Ollama API key").grid(row=9, column=0, sticky="w", pady=5)
-        ttk.Entry(body, textvariable=self.api_key, show="*").grid(row=9, column=1, columnspan=2, sticky="ew", pady=5)
-        ttk.Label(body, text="Local model").grid(row=10, column=0, sticky="w", pady=5)
-        ttk.Entry(body, textvariable=self.model).grid(row=10, column=1, columnspan=2, sticky="ew", pady=5)
+        ttk.Entry(body, textvariable=self.api_key, show="*").grid(row=9, column=1, sticky="ew", pady=5)
+        ttk.Button(body, text="Create API key", command=lambda: self._open_url(OLLAMA_KEYS_URL)).grid(
+            row=9, column=2, padx=(8, 0), pady=5
+        )
+        ttk.Label(
+            body,
+            text="The key is used for Ollama Web Search. A free Ollama account is required.",
+            wraplength=520,
+        ).grid(row=10, column=1, sticky="w", pady=(0, 5))
+        ttk.Button(body, text="API key guide", command=lambda: self._open_url(OLLAMA_WEB_SEARCH_GUIDE_URL)).grid(
+            row=10, column=2, padx=(8, 0), pady=(0, 5)
+        )
+        ttk.Label(body, text="Local model").grid(row=11, column=0, sticky="w", pady=5)
+        ttk.Entry(body, textvariable=self.model).grid(row=11, column=1, sticky="ew", pady=5)
+        self.ollama_button = ttk.Button(body, text="Download Ollama", command=lambda: self._open_url(OLLAMA_DOWNLOAD_URL))
+        self.ollama_button.grid(row=11, column=2, padx=(8, 0), pady=5)
 
-        ttk.Separator(body).grid(row=11, column=0, columnspan=3, sticky="ew", pady=14)
-        ttk.Label(body, textvariable=self.status, wraplength=640).grid(row=12, column=0, columnspan=3, sticky="w", pady=(0, 12))
+        ttk.Separator(body).grid(row=12, column=0, columnspan=3, sticky="ew", pady=14)
+        ttk.Checkbutton(
+            body,
+            text="Start automatically when I sign in",
+            variable=self.start_at_login,
+        ).grid(row=13, column=0, columnspan=3, sticky="w", pady=3)
+        ttk.Checkbutton(
+            body,
+            text="Create a desktop shortcut",
+            variable=self.desktop_icon,
+        ).grid(row=14, column=0, columnspan=3, sticky="w", pady=3)
+        ttk.Label(body, textvariable=self.status, wraplength=660).grid(row=15, column=0, columnspan=3, sticky="w", pady=(10, 12))
         self.progress = ttk.Progressbar(body, mode="indeterminate")
-        self.progress.grid(row=13, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+        self.progress.grid(row=16, column=0, columnspan=3, sticky="ew", pady=(0, 12))
         self.progress.grid_remove()
         self.install_button = ttk.Button(body, text="Install and start", command=self.install)
-        self.install_button.grid(row=14, column=2, sticky="e")
+        self.install_button.grid(row=17, column=2, sticky="e")
+
+    def _open_url(self, url: str) -> None:
+        try:
+            open_external_url(url)
+        except RuntimeError as error:
+            messagebox.showerror("Could not open link", str(error), parent=self.root)
 
     def _run(self, work: Callable[[], T], done: Callable[[T], None]) -> None:
         self.install_button.configure(state="disabled")
@@ -140,6 +200,11 @@ class SetupWindow:
         except Exception as error:
             self.status.set(str(error))
             return
+
+        if player.ollama_executable():
+            self.ollama_button.configure(text="Ollama installed", state="disabled")
+        else:
+            self.ollama_button.configure(text="Download Ollama", state="normal")
 
         if self.current:
             current_path = Path(self.current.browser_path)
@@ -264,9 +329,11 @@ class SetupWindow:
         except Exception as error:
             self._finish_error(error)
             return
-        self.status.set("Checking Telegram, Ollama, browser integration, and startup...")
+        start_at_login = self.start_at_login.get()
+        desktop_icon = self.desktop_icon.get()
+        self.status.set("Checking Telegram, Ollama, browser integration, and installation...")
 
-        def work() -> Path:
+        def work() -> tuple[Path | None, Path | None]:
             player.TelegramAPI(config.bot_token).get_me()
             player.LinkFinder(config).check(pull_if_missing=True)
             player.write_json_secure(player.CONFIG_FILE, asdict(config))
@@ -274,11 +341,18 @@ class SetupWindow:
             browser = Path(config.browser_path)
             player.prepare_player_integration(spec, browser, player.browser_profile_dir(spec.key, browser))
             command = native.installed_runtime_command(Path(player.__file__))
-            return native.install_autostart(command, player.SERVICE_FILE)
+            return apply_launch_options(command, start_at_login, desktop_icon, player.SERVICE_FILE)
 
-        def done(startup_file: Path) -> None:
+        def done(result: tuple[Path | None, Path | None]) -> None:
+            startup_file, shortcut = result
             self._finish()
-            self.status.set(f"Installed and started. Startup item: {startup_file}")
+            options = []
+            if startup_file:
+                options.append("startup enabled")
+            if shortcut:
+                options.append("desktop shortcut created")
+            suffix = "; ".join(options) if options else "manual startup"
+            self.status.set(f"Installed and started; {suffix}.")
             messagebox.showinfo("Setup complete", "Telegram YouTube Player is installed and running.", parent=self.root)
 
         self._run(work, done)

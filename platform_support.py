@@ -642,7 +642,8 @@ def valid_saved_process(pid: int, profile_dir: Path, executable: Path | None = N
             )
         except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return False
-        return str(pid) in result.stdout and (executable is None or executable.name.casefold() in result.stdout.casefold())
+        output = result.stdout or ""
+        return str(pid) in output and (executable is None or executable.name.casefold() in output.casefold())
     if system == "Linux":
         try:
             command = (Path("/proc") / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ").decode()
@@ -657,7 +658,7 @@ def valid_saved_process(pid: int, profile_dir: Path, executable: Path | None = N
                 text=True,
                 timeout=5,
             )
-            command = result.stdout
+            command = result.stdout or ""
         except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return False
     return str(profile_dir) in command
@@ -729,6 +730,11 @@ def windows_startup_contents(command: Sequence[str]) -> str:
     return "@echo off\r\nstart \"\" /min " + subprocess.list2cmdline(list(command)) + "\r\n"
 
 
+def autostart_installed(service_file: Path | None = None, system: str | None = None) -> bool:
+    paths = application_paths(system)
+    return (service_file or paths.service_file).is_file()
+
+
 def install_autostart(command: Sequence[str], service_file: Path | None = None, system: str | None = None) -> Path:
     system = host_system(system)
     paths = application_paths(system)
@@ -753,6 +759,153 @@ def install_autostart(command: Sequence[str], service_file: Path | None = None, 
         subprocess.run(["launchctl", "bootout", domain, str(service_file)], check=False, capture_output=True)
         subprocess.run(["launchctl", "bootstrap", domain, str(service_file)], check=True)
     return service_file
+
+
+def remove_autostart(service_file: Path | None = None, system: str | None = None) -> bool:
+    system = host_system(system)
+    paths = application_paths(system)
+    service_file = paths.service_file if service_file is None else service_file
+    existed = service_file.is_file()
+    if system == "Linux" and existed:
+        subprocess.run(["systemctl", "--user", "disable", "--now", service_file.name], check=False, capture_output=True)
+        service_file.unlink(missing_ok=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, capture_output=True)
+    elif system == "Darwin" and existed:
+        domain = f"gui/{os.getuid()}"
+        subprocess.run(["launchctl", "bootout", domain, str(service_file)], check=False, capture_output=True)
+        service_file.unlink(missing_ok=True)
+    else:
+        service_file.unlink(missing_ok=True)
+    return existed
+
+
+def start_application(command: Sequence[str], system: str | None = None) -> subprocess.Popen[bytes]:
+    system = host_system(system)
+    options: dict[str, object] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if system == "Windows":
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    else:
+        options["start_new_session"] = True
+    return subprocess.Popen(list(command), **options)
+
+
+def desktop_directory(
+    system: str | None = None,
+    home: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    system = host_system(system)
+    home = Path.home() if home is None else home
+    environ = os.environ if environ is None else environ
+    if system == "Windows":
+        return Path(environ.get("USERPROFILE", home)) / "Desktop"
+    if system == "Darwin":
+        return home / "Desktop"
+    configured = environ.get("XDG_DESKTOP_DIR", "").strip()
+    if not configured:
+        user_dirs = Path(environ.get("XDG_CONFIG_HOME", home / ".config")) / "user-dirs.dirs"
+        try:
+            match = re.search(r'^XDG_DESKTOP_DIR="([^"]+)"', user_dirs.read_text(encoding="utf-8"), re.MULTILINE)
+            configured = match.group(1) if match else ""
+        except OSError:
+            configured = ""
+    if configured:
+        return Path(configured.replace("$HOME", str(home))).expanduser()
+    return home / "Desktop"
+
+
+def desktop_shortcut_paths(
+    system: str | None = None,
+    home: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[Path, ...]:
+    system = host_system(system)
+    desktop = desktop_directory(system, home, environ)
+    if system == "Windows":
+        return (desktop / f"{APP_TITLE}.lnk",)
+    if system == "Darwin":
+        return (desktop / f"{APP_TITLE}.app", desktop / f"{APP_TITLE}.command")
+    return (desktop / f"{APP_TITLE}.desktop",)
+
+
+def desktop_shortcut_installed(system: str | None = None) -> bool:
+    return any(path.is_file() or path.is_symlink() for path in desktop_shortcut_paths(system))
+
+
+def remove_desktop_shortcut(system: str | None = None) -> bool:
+    removed = False
+    for path in desktop_shortcut_paths(system):
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+            removed = True
+    return removed
+
+
+def linux_desktop_shortcut_contents(command: Sequence[str]) -> str:
+    executable = " ".join('"' + item.replace("\\", "\\\\").replace('"', '\\"') + '"' for item in command)
+    return f"""[Desktop Entry]
+Name={APP_TITLE}
+Comment=Configure Telegram-controlled browser playback
+Exec={executable}
+Icon=video-display
+Terminal=false
+Type=Application
+Categories=AudioVideo;Utility;
+"""
+
+
+def _powershell_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def windows_shortcut_script(shortcut: Path, command: Sequence[str]) -> str:
+    target = str(command[0])
+    arguments = subprocess.list2cmdline(list(command[1:]))
+    return (
+        "$shell = New-Object -ComObject WScript.Shell; "
+        f"$shortcut = $shell.CreateShortcut({_powershell_literal(str(shortcut))}); "
+        f"$shortcut.TargetPath = {_powershell_literal(target)}; "
+        f"$shortcut.Arguments = {_powershell_literal(arguments)}; "
+        f"$shortcut.WorkingDirectory = {_powershell_literal(str(Path(target).parent))}; "
+        f"$shortcut.IconLocation = {_powershell_literal(target)}; "
+        f"$shortcut.Description = {_powershell_literal(APP_TITLE)}; "
+        "$shortcut.Save()"
+    )
+
+
+def install_desktop_shortcut(command: Sequence[str], system: str | None = None) -> Path:
+    if not command:
+        raise RuntimeError("Desktop shortcut command is empty")
+    system = host_system(system)
+    paths = desktop_shortcut_paths(system)
+    paths[0].parent.mkdir(parents=True, exist_ok=True)
+    remove_desktop_shortcut(system)
+    if system == "Linux":
+        shortcut = paths[0]
+        shortcut.write_text(linux_desktop_shortcut_contents(command), encoding="utf-8")
+        shortcut.chmod(0o755)
+        return shortcut
+    if system == "Windows":
+        shortcut = paths[0]
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", windows_shortcut_script(shortcut, command)],
+            check=True,
+            timeout=30,
+        )
+        return shortcut
+    executable = Path(command[0])
+    bundle = next((parent for parent in executable.parents if parent.suffix == ".app"), None)
+    if bundle:
+        shortcut = paths[0]
+        shortcut.symlink_to(bundle)
+    else:
+        shortcut = paths[1]
+        shortcut.write_text("#!/bin/sh\nexec " + shlex.join(list(command)) + "\n", encoding="utf-8")
+        shortcut.chmod(0o755)
+    return shortcut
 
 
 def installed_runtime_command(source_script: Path, system: str | None = None) -> list[str]:

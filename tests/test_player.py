@@ -200,6 +200,29 @@ class PlaybackQueueTests(unittest.TestCase):
         self.assertIn("Now: First", status)
         self.assertIn("1. Second", status)
 
+    def test_skip_to_last_keeps_final_item(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            queue = player.PlaybackQueue(path)
+            queue.enqueue(
+                [
+                    player.youtube_queue_item("https://youtu.be/first"),
+                    player.youtube_queue_item("https://youtu.be/second"),
+                    player.youtube_queue_item("https://youtu.be/last"),
+                ]
+            )
+            previous, current, skipped = queue.skip_to_last()
+            self.assertEqual("first", previous.media_id)
+            self.assertEqual("last", current.media_id)
+            self.assertEqual(2, skipped)
+            self.assertEqual([], queue.snapshot()["pending"])
+            self.assertEqual("last", player.PlaybackQueue(path).snapshot()["current"]["media_id"])
+
+            previous, current, skipped = queue.skip_to_last()
+            self.assertEqual("last", previous.media_id)
+            self.assertEqual("last", current.media_id)
+            self.assertEqual(0, skipped)
+
 
 class MonitorTests(unittest.TestCase):
     def test_finds_and_scales_monitor(self):
@@ -413,6 +436,11 @@ class LinkFinderTests(unittest.TestCase):
             ["/usr/bin/ollama", "pull", "qwen3:0.6b-q4_K_M"],
             run.call_args_list[1].args[0],
         )
+
+    def test_ollama_executable_uses_platform_install_location(self):
+        with mock.patch("player.shutil.which", return_value=None), mock.patch.object(Path, "is_file", return_value=True):
+            executable = player.ollama_executable("Windows")
+        self.assertEqual("ollama.exe", executable.name)
 
 
 class BrowserTests(unittest.TestCase):
