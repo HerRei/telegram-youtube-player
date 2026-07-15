@@ -6,7 +6,6 @@ import argparse
 import ctypes
 import ctypes.util
 import getpass
-import html
 import http.server
 import ipaddress
 import json
@@ -14,10 +13,12 @@ import logging
 import os
 import platform
 import re
+import secrets
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -41,6 +42,7 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 STATE_FILE = STATE_DIR / "state.json"
 PLAYER_PID_FILE = STATE_DIR / "browser-player.json"
 LEGACY_PLAYER_PID_FILE = STATE_DIR / "firefox-player.json"
+QUEUE_FILE = STATE_DIR / "queue.json"
 PROFILE_DIR = CONFIG_DIR / "firefox-profile"
 MONITORS_FILE = Path.home() / ".config/monitors.xml"
 SERVICE_FILE = APP_PATHS.service_file
@@ -397,20 +399,277 @@ def youtube_playback_url(url: str) -> str:
     return url
 
 
-def player_embed_url(embed_url: str, origin: str) -> str:
-    parsed = urllib.parse.urlsplit(embed_url)
-    hostname = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or hostname not in {"www.youtube.com", "youtube.com", "www.youtube-nocookie.com"}:
-        raise ValueError("The local player accepts only HTTPS YouTube embed URLs")
-    if not parsed.path.startswith("/embed/"):
-        raise ValueError("The local player accepts only YouTube embed paths")
-    query = [(key, value) for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if key != "origin"]
-    query.append(("origin", origin))
-    return urllib.parse.urlunsplit(("https", hostname, parsed.path, urllib.parse.urlencode(query), ""))
+def _youtube_start_seconds(value: str) -> int:
+    if value.isdigit():
+        return min(int(value), 24 * 60 * 60)
+    match = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", value)
+    if not match or not any(match.groups()):
+        return 0
+    hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    return min(hours * 3600 + minutes * 60 + seconds, 24 * 60 * 60)
 
 
-def player_document(embed_url: str) -> bytes:
-    escaped_url = html.escape(embed_url, quote=True)
+@dataclass(frozen=True)
+class QueueItem:
+    token: str
+    kind: str
+    media_id: str
+    source_url: str
+    title: str
+    start_seconds: int = 0
+    index: int = 0
+
+    @classmethod
+    def load(cls, data: dict[str, Any]) -> "QueueItem":
+        item = cls(
+            token=str(data["token"]),
+            kind=str(data["kind"]),
+            media_id=str(data["media_id"]),
+            source_url=str(data["source_url"]),
+            title=str(data["title"]),
+            start_seconds=int(data.get("start_seconds", 0)),
+            index=int(data.get("index", 0)),
+        )
+        if item.kind not in {"video", "playlist"}:
+            raise ValueError("Invalid queue item type")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", item.media_id):
+            raise ValueError("Invalid YouTube media ID")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", item.token):
+            raise ValueError("Invalid queue token")
+        return item
+
+
+def youtube_queue_item(url: str, title: str = "") -> QueueItem:
+    normalized = normalize_youtube_url(url)
+    if not normalized:
+        raise ValueError("A valid YouTube link is required")
+    embed = urllib.parse.urlsplit(youtube_playback_url(normalized))
+    parts = [part for part in embed.path.split("/") if part]
+    query = dict(urllib.parse.parse_qsl(embed.query, keep_blank_values=True))
+
+    if parts == ["embed", "videoseries"] and re.fullmatch(r"[A-Za-z0-9_-]{1,160}", query.get("list", "")):
+        kind = "playlist"
+        media_id = query["list"]
+        source_url = f"https://www.youtube.com/playlist?list={media_id}"
+        try:
+            index = max(int(query.get("index", "1")) - 1, 0)
+        except ValueError:
+            index = 0
+        start_seconds = 0
+    elif len(parts) == 2 and parts[0] == "embed" and re.fullmatch(r"[A-Za-z0-9_-]{1,160}", parts[1]):
+        kind = "video"
+        media_id = parts[1]
+        source_url = f"https://www.youtube.com/watch?v={media_id}"
+        index = 0
+        start_seconds = _youtube_start_seconds(query.get("start") or query.get("t") or "")
+    else:
+        raise ValueError("The YouTube link does not identify a video or playlist")
+
+    clean_title = re.sub(r"\s+", " ", title).strip()[:200]
+    return QueueItem(
+        token=secrets.token_urlsafe(12),
+        kind=kind,
+        media_id=media_id,
+        source_url=source_url,
+        title=clean_title or source_url,
+        start_seconds=start_seconds,
+        index=index,
+    )
+
+
+class PlaybackQueue:
+    def __init__(self, path: Path | None = QUEUE_FILE) -> None:
+        self.path = path
+        self.lock = threading.RLock()
+        self.current: QueueItem | None = None
+        self.pending: list[QueueItem] = []
+        self.revision = 0
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path:
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            current = QueueItem.load(data["current"]) if data.get("current") else None
+            pending = [QueueItem.load(item) for item in data.get("pending", [])]
+        except FileNotFoundError:
+            return
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            LOG.warning("Ignoring invalid playback queue: %s", error)
+            return
+        if current is None and pending:
+            current = pending.pop(0)
+        self.current = current
+        self.pending = pending
+
+    def _save(self) -> None:
+        if not self.path:
+            return
+        if self.current is None and not self.pending:
+            self.path.unlink(missing_ok=True)
+            return
+        write_json_secure(
+            self.path,
+            {
+                "current": asdict(self.current) if self.current else None,
+                "pending": [asdict(item) for item in self.pending],
+            },
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "revision": self.revision,
+                "current": asdict(self.current) if self.current else None,
+                "pending": [asdict(item) for item in self.pending],
+            }
+
+    def enqueue(self, items: list[QueueItem]) -> list[int]:
+        if not items:
+            return []
+        with self.lock:
+            positions: list[int] = []
+            for item in items:
+                if self.current is None:
+                    self.current = item
+                    positions.append(0)
+                else:
+                    self.pending.append(item)
+                    positions.append(len(self.pending))
+            self.revision += 1
+            self._save()
+            return positions
+
+    def advance(self, expected_token: str | None = None) -> tuple[QueueItem | None, QueueItem | None]:
+        with self.lock:
+            if self.current is None or (expected_token and expected_token != self.current.token):
+                return None, self.current
+            previous = self.current
+            self.current = self.pending.pop(0) if self.pending else None
+            self.revision += 1
+            self._save()
+            return previous, self.current
+
+    def clear_pending(self) -> int:
+        with self.lock:
+            count = len(self.pending)
+            if count:
+                self.pending.clear()
+                self.revision += 1
+                self._save()
+            return count
+
+    def clear(self) -> int:
+        with self.lock:
+            count = len(self.pending) + int(self.current is not None)
+            if count:
+                self.current = None
+                self.pending.clear()
+                self.revision += 1
+                self._save()
+            return count
+
+
+def player_script(control_token: str, origin: str) -> str:
+    script = """const controlToken = __CONTROL_TOKEN__;
+const playerOrigin = __PLAYER_ORIGIN__;
+let player = null;
+let ready = false;
+let currentToken = null;
+let wanted = null;
+let hasPlayed = false;
+let advancing = false;
+
+async function requestState(path, options = {}) {
+  const headers = Object.assign({}, options.headers || {}, {"X-Player-Token": controlToken});
+  const response = await fetch(path, Object.assign({}, options, {headers, cache: "no-store"}));
+  if (!response.ok) throw new Error(`Player request failed: ${response.status}`);
+  return response.json();
+}
+
+function loadItem(item) {
+  currentToken = item.token;
+  hasPlayed = false;
+  if (item.kind === "playlist") {
+    player.loadPlaylist({list: item.media_id, listType: "playlist", index: item.index || 0});
+  } else {
+    player.loadVideoById({videoId: item.media_id, startSeconds: item.start_seconds || 0});
+  }
+}
+
+function applyState(state) {
+  wanted = state.current;
+  if (!ready) return;
+  if (!wanted) {
+    if (currentToken !== null || hasPlayed) player.stopVideo();
+    currentToken = null;
+    hasPlayed = false;
+    return;
+  }
+  if (wanted.token !== currentToken) loadItem(wanted);
+}
+
+async function syncState() {
+  try {
+    applyState(await requestState("/api/queue"));
+  } catch (_) {
+  }
+}
+
+async function advance() {
+  if (!currentToken || advancing) return;
+  const completedToken = currentToken;
+  advancing = true;
+  try {
+    const state = await requestState("/api/advance", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({token: completedToken})
+    });
+    if (currentToken === completedToken) currentToken = null;
+    applyState(state);
+  } catch (_) {
+    setTimeout(advance, 1000);
+  } finally {
+    advancing = false;
+  }
+}
+
+function onStateChange(event) {
+  if (event.data === YT.PlayerState.PLAYING) hasPlayed = true;
+  if (event.data !== YT.PlayerState.ENDED || !hasPlayed || !wanted) return;
+  if (wanted.kind === "playlist") {
+    const playlist = player.getPlaylist() || [];
+    const index = player.getPlaylistIndex();
+    if (playlist.length && index >= 0 && index < playlist.length - 1) return;
+  }
+  advance();
+}
+
+window.onYouTubeIframeAPIReady = function () {
+  player = new YT.Player("player", {
+    width: "100%",
+    height: "100%",
+    playerVars: {autoplay: 1, origin: playerOrigin},
+    events: {
+      onReady: function () { ready = true; applyState({current: wanted}); },
+      onStateChange: onStateChange,
+      onError: advance
+    }
+  });
+};
+
+syncState();
+setInterval(syncState, 1000);
+"""
+    return script.replace("__CONTROL_TOKEN__", json.dumps(control_token)).replace(
+        "__PLAYER_ORIGIN__", json.dumps(origin)
+    )
+
+
+def player_document(control_token: str, origin: str) -> bytes:
+    script = player_script(control_token, origin)
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -419,26 +678,27 @@ def player_document(embed_url: str) -> bytes:
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>YouTube Player</title>
   <style>
-    html, body, iframe {{ width: 100%; height: 100%; margin: 0; border: 0; overflow: hidden; background: #000; }}
-    iframe {{ display: block; }}
+    html, body, #player {{ width: 100%; height: 100%; margin: 0; border: 0; overflow: hidden; background: #000; }}
   </style>
 </head>
 <body>
-  <iframe src="{escaped_url}" title="YouTube video player"
-    referrerpolicy="strict-origin-when-cross-origin"
-    allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
-    allowfullscreen></iframe>
+  <div id="player"></div>
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script>{script}</script>
 </body>
 </html>
 """.encode("utf-8")
 
 
 class LocalPlaybackServer:
-    def __init__(self) -> None:
+    def __init__(self, queue: PlaybackQueue) -> None:
         owner = self
 
         class RequestHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:
+                owner.handle(self)
+
+            def do_POST(self) -> None:
                 owner.handle(self)
 
             def log_message(self, _format: str, *_args: object) -> None:
@@ -448,41 +708,73 @@ class LocalPlaybackServer:
         self.server.daemon_threads = True
         host, port = self.server.server_address
         self.origin = f"http://{host}:{port}"
+        self.queue = queue
+        self.control_token = secrets.token_urlsafe(24)
         self.thread = threading.Thread(target=self.server.serve_forever, name="local-youtube-player", daemon=True)
         self.thread.start()
 
-    def page_url(self, embed_url: str) -> str:
-        identified_embed = player_embed_url(embed_url, self.origin)
-        return f"{self.origin}/player?src={urllib.parse.quote(identified_embed, safe='')}"
+    def page_url(self) -> str:
+        return f"{self.origin}/player?token={urllib.parse.quote(self.control_token, safe='')}"
+
+    @staticmethod
+    def _response(request: http.server.BaseHTTPRequestHandler, status: int, content_type: str, body: bytes) -> None:
+        request.send_response(status)
+        request.send_header("Content-Type", content_type)
+        request.send_header("Content-Length", str(len(body)))
+        request.send_header("Cache-Control", "no-store")
+        request.send_header("X-Content-Type-Options", "nosniff")
+        request.end_headers()
+        request.wfile.write(body)
+
+    def _authorized(self, request: http.server.BaseHTTPRequestHandler) -> bool:
+        return secrets.compare_digest(request.headers.get("X-Player-Token", ""), self.control_token)
 
     def handle(self, request: http.server.BaseHTTPRequestHandler) -> None:
         parsed = urllib.parse.urlsplit(request.path)
-        query = urllib.parse.parse_qs(parsed.query)
-        try:
-            if parsed.path != "/player" or len(query.get("src", [])) != 1:
-                raise ValueError("Invalid player request")
-            embed_url = player_embed_url(query["src"][0], self.origin)
-            document = player_document(embed_url)
-        except ValueError as error:
-            response = str(error).encode("utf-8")
-            request.send_response(400)
-            request.send_header("Content-Type", "text/plain; charset=utf-8")
-            request.send_header("Content-Length", str(len(response)))
+        if request.command == "GET" and parsed.path == "/player":
+            token = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
+            if not secrets.compare_digest(token, self.control_token):
+                self._response(request, 403, "text/plain; charset=utf-8", b"Forbidden")
+                return
+            document = player_document(self.control_token, self.origin)
+            request.send_response(200)
+            request.send_header("Content-Type", "text/html; charset=utf-8")
+            request.send_header("Content-Length", str(len(document)))
+            request.send_header("Cache-Control", "no-store")
+            request.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+            request.send_header("X-Content-Type-Options", "nosniff")
+            request.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; script-src 'unsafe-inline' https://www.youtube.com https://s.ytimg.com; "
+                "frame-src https://www.youtube.com https://www.youtube-nocookie.com; connect-src 'self'; "
+                "style-src 'unsafe-inline'; frame-ancestors 'none'",
+            )
             request.end_headers()
-            request.wfile.write(response)
+            request.wfile.write(document)
             return
 
-        request.send_response(200)
-        request.send_header("Content-Type", "text/html; charset=utf-8")
-        request.send_header("Content-Length", str(len(document)))
-        request.send_header("Cache-Control", "no-store")
-        request.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
-        request.send_header(
-            "Content-Security-Policy",
-            "default-src 'none'; frame-src https://www.youtube.com https://www.youtube-nocookie.com; style-src 'unsafe-inline'",
-        )
-        request.end_headers()
-        request.wfile.write(document)
+        if parsed.path not in {"/api/queue", "/api/advance"} or not self._authorized(request):
+            self._response(request, 403, "text/plain; charset=utf-8", b"Forbidden")
+            return
+        if request.command == "GET" and parsed.path == "/api/queue":
+            body = json.dumps(self.queue.snapshot()).encode("utf-8")
+            self._response(request, 200, "application/json; charset=utf-8", body)
+            return
+        if request.command == "POST" and parsed.path == "/api/advance":
+            try:
+                length = int(request.headers.get("Content-Length", "0"))
+                if length < 2 or length > 4096:
+                    raise ValueError
+                payload = json.loads(request.rfile.read(length))
+                completed_token = str(payload["token"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                self._response(request, 400, "text/plain; charset=utf-8", b"Invalid request")
+                return
+            self.queue.advance(completed_token)
+            body = json.dumps(self.queue.snapshot()).encode("utf-8")
+            self._response(request, 200, "application/json; charset=utf-8", body)
+            return
+        self._response(request, 405, "text/plain; charset=utf-8", b"Method not allowed")
 
     def close(self) -> None:
         self.server.shutdown()
@@ -931,25 +1223,33 @@ class BrowserPlayer:
     def _valid_saved_process(pid: int, profile_dir: Path, executable: Path | None = None) -> bool:
         return native.valid_saved_process(pid, profile_dir, executable)
 
-    def stop(self) -> bool:
-        stopped = False
-        pid, window_id = 0, 0
+    def _saved_player(self) -> dict[str, Any] | None:
         for state_file in (PLAYER_PID_FILE, LEGACY_PLAYER_PID_FILE):
             try:
                 saved = json.loads(state_file.read_text(encoding="utf-8"))
                 candidate_pid = int(saved["pid"])
-                candidate_window = int(saved.get("window_id") or 0)
                 default_profile = PROFILE_DIR if state_file == LEGACY_PLAYER_PID_FILE else self.profile_dir
                 saved_profile = Path(str(saved.get("profile_dir") or default_profile))
                 saved_executable = Path(str(saved["executable"])) if saved.get("executable") else None
             except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
             if self._valid_saved_process(candidate_pid, saved_profile, saved_executable):
-                pid, window_id = candidate_pid, candidate_window
-                break
+                saved["pid"] = candidate_pid
+                saved["window_id"] = int(saved.get("window_id") or 0)
+                return saved
+        return None
 
-        valid_process = bool(pid)
-        if platform.system() == "Linux" and window_id and valid_process and os.environ.get("DISPLAY"):
+    def is_running(self, url: str | None = None) -> bool:
+        saved = self._saved_player()
+        return bool(saved and (url is None or saved.get("url") == url))
+
+    def stop(self) -> bool:
+        stopped = False
+        saved = self._saved_player()
+        pid = int(saved["pid"]) if saved else 0
+        window_id = int(saved["window_id"]) if saved else 0
+
+        if platform.system() == "Linux" and window_id and pid and os.environ.get("DISPLAY"):
             try:
                 with X11WindowManager() as window_manager:
                     window_manager.close_window(window_id)
@@ -958,7 +1258,7 @@ class BrowserPlayer:
             except RuntimeError as error:
                 LOG.warning("Could not close the old player window cleanly: %s", error)
 
-        if valid_process:
+        if pid:
             native.terminate_process(pid)
             stopped = True
 
@@ -1000,6 +1300,7 @@ class BrowserPlayer:
                 "window_id": 0,
                 "profile_dir": str(self.profile_dir),
                 "executable": str(self.executable),
+                "url": url,
             },
         )
 
@@ -1021,6 +1322,7 @@ class BrowserPlayer:
                 "window_id": self.window_id,
                 "profile_dir": str(self.profile_dir),
                 "executable": str(self.executable),
+                "url": url,
             },
         )
         return monitor
@@ -1059,13 +1361,40 @@ def authorized(config: Config, message: dict[str, Any]) -> bool:
         return False
 
 
+def queue_item_text(item: dict[str, Any]) -> str:
+    title = str(item.get("title") or item.get("source_url") or "YouTube item")
+    source_url = str(item.get("source_url") or "")
+    return title if title == source_url or not source_url else f"{title} ({source_url})"
+
+
+def queue_status_text(queue: PlaybackQueue) -> str:
+    state = queue.snapshot()
+    current = state["current"]
+    pending = state["pending"]
+    if not current:
+        return "Queue is empty."
+    lines = [f"Now: {queue_item_text(current)}"]
+    lines.extend(f"{index}. {queue_item_text(item)}" for index, item in enumerate(pending[:10], 1))
+    if len(pending) > 10:
+        lines.append(f"...and {len(pending) - 10} more.")
+    return "\n".join(lines)
+
+
+def ensure_queue_player(player: BrowserPlayer, playback_server: LocalPlaybackServer) -> Monitor:
+    page_url = playback_server.page_url()
+    if player.is_running(page_url):
+        return find_monitor(player.monitor_product, connector=player.monitor_connector)
+    return player.play(page_url)
+
+
 def run_bot() -> None:
     config = Config.load()
     api = TelegramAPI(config.bot_token)
     player = BrowserPlayer(config)
     link_finder = LinkFinder(config)
     link_finder.check()
-    playback_server = LocalPlaybackServer()
+    queue = PlaybackQueue()
+    playback_server = LocalPlaybackServer(queue)
     offset = load_offset()
     retry_delay = 1
     bot = api.get_me()
@@ -1075,6 +1404,8 @@ def run_bot() -> None:
         config.allowed_chat_id,
         playback_server.origin,
     )
+    if queue.snapshot()["current"]:
+        ensure_queue_player(player, playback_server)
 
     while True:
         try:
@@ -1101,11 +1432,31 @@ def run_bot() -> None:
                     api.send_message(
                         chat_id,
                         f"Send a YouTube link or describe a page to open on {config.target_monitor_product}. "
-                        "Commands: /status, /stop",
+                        "Commands: /queue, /skip, /clear, /status, /stop",
                     )
                     continue
                 if command == "/stop":
-                    api.send_message(chat_id, "Playback stopped." if player.stop() else "Nothing is currently playing.")
+                    removed = queue.clear()
+                    stopped = player.stop()
+                    api.send_message(chat_id, "Playback stopped and queue cleared." if removed or stopped else "Nothing is playing.")
+                    continue
+                if command == "/queue":
+                    api.send_message(chat_id, queue_status_text(queue))
+                    continue
+                if command == "/skip":
+                    previous, next_item = queue.advance()
+                    if not previous:
+                        api.send_message(chat_id, "Queue is empty.")
+                    elif next_item:
+                        ensure_queue_player(player, playback_server)
+                        api.send_message(chat_id, f"Skipping to {queue_item_text(asdict(next_item))}.")
+                    else:
+                        api.send_message(chat_id, "Skipped. Queue is empty.")
+                    continue
+                if command == "/clear":
+                    removed = queue.clear_pending()
+                    suffix = "s" if removed != 1 else ""
+                    api.send_message(chat_id, f"Removed {removed} queued item{suffix}.")
                     continue
                 if command == "/status":
                     monitor = find_monitor(
@@ -1113,14 +1464,16 @@ def run_bot() -> None:
                         connector=config.target_monitor_connector,
                     )
                     spec = browser_spec(config.browser_type)
+                    state = queue.snapshot()
+                    queue_size = len(state["pending"]) + int(state["current"] is not None)
                     api.send_message(
                         chat_id,
                         f"Ready. Browser: {spec.label}. Target: {monitor.product} on "
-                        f"{monitor.connector} ({monitor.width}x{monitor.height}).",
+                        f"{monitor.connector} ({monitor.width}x{monitor.height}). Queue: {queue_size}.",
                     )
                     continue
                 if command:
-                    api.send_message(chat_id, "Unknown command. Use /help, /status, or /stop.")
+                    api.send_message(chat_id, "Unknown command. Use /help for available commands.")
                     continue
 
                 links = youtube_links(message)
@@ -1136,18 +1489,31 @@ def run_bot() -> None:
                     api.send_message(chat_id, "Searching for the best matching page...")
                     result = link_finder.find(text)
                     youtube_result = normalize_youtube_url(result.url)
-                    target_url = (
-                        playback_server.page_url(youtube_playback_url(youtube_result))
-                        if youtube_result
-                        else result.url
-                    )
-                    monitor = player.play(target_url)
-                    api.send_message(chat_id, f"Opening {result.title} on {monitor.product}.")
+                    if youtube_result:
+                        item = youtube_queue_item(youtube_result, result.title)
+                        position = queue.enqueue([item])[0]
+                        monitor = ensure_queue_player(player, playback_server)
+                        action = "Playing" if position == 0 else f"Queued at position {position}"
+                        api.send_message(chat_id, f"{action}: {result.title} on {monitor.product}.")
+                    else:
+                        queue.clear()
+                        monitor = player.play(result.url)
+                        api.send_message(chat_id, f"Opening {result.title} on {monitor.product}.")
                     continue
 
-                embed_url = youtube_playback_url(links[0])
-                monitor = player.play(playback_server.page_url(embed_url))
-                api.send_message(chat_id, f"Playing on {monitor.product}.")
+                items = [youtube_queue_item(link) for link in links]
+                positions = queue.enqueue(items)
+                monitor = ensure_queue_player(player, playback_server)
+                if positions[0] == 0:
+                    queued = len(items) - 1
+                    suffix = f" {queued} more queued." if queued else ""
+                    api.send_message(chat_id, f"Playing on {monitor.product}.{suffix}")
+                else:
+                    suffix = "s" if len(items) != 1 else ""
+                    api.send_message(
+                        chat_id,
+                        f"Added {len(items)} item{suffix} to the queue from position {positions[0]}.",
+                    )
             except Exception as error:
                 LOG.exception("Could not handle Telegram update")
                 if message_from_update(update) and authorized(config, message_from_update(update) or {}):
@@ -1391,13 +1757,55 @@ def check_configuration() -> None:
     print("Configuration check passed.")
 
 
+def queue_smoke_test() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory() as directory:
+        queue_path = Path(directory) / "queue.json"
+        queue = PlaybackQueue(queue_path)
+        first = youtube_queue_item("https://youtu.be/first123?t=12")
+        second = youtube_queue_item("https://www.youtube.com/watch?v=second456")
+        if queue.enqueue([first, second]) != [0, 1]:
+            raise RuntimeError("Queue order test failed")
+        server = LocalPlaybackServer(queue)
+        try:
+            with urllib.request.urlopen(server.page_url(), timeout=5) as response:
+                page = response.read().decode("utf-8")
+            if "youtube.com/iframe_api" not in page:
+                raise RuntimeError("Player API test failed")
+
+            headers = {"X-Player-Token": server.control_token}
+            request = urllib.request.Request(f"{server.origin}/api/queue", headers=headers)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                state = json.load(response)
+            if state["current"]["media_id"] != "first123" or len(state["pending"]) != 1:
+                raise RuntimeError("Queue state test failed")
+
+            body = json.dumps({"token": first.token}).encode("utf-8")
+            request = urllib.request.Request(
+                f"{server.origin}/api/advance",
+                data=body,
+                method="POST",
+                headers={**headers, "Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                state = json.load(response)
+            if state["current"]["media_id"] != "second456":
+                raise RuntimeError("Queue advance test failed")
+        finally:
+            server.close()
+
+        restored = PlaybackQueue(queue_path).snapshot()
+        if restored["current"]["media_id"] != "second456":
+            raise RuntimeError("Queue persistence test failed")
+        return {"queue": "ok", "player_api": "ok", "persistence": "ok"}
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Open Telegram links on a selected monitor.")
     parser.add_argument(
         "command",
         nargs="?",
         default="setup",
-        choices=["run", "setup", "configure", "install", "check", "smoke-test"],
+        choices=["run", "setup", "configure", "install", "check", "smoke-test", "queue-smoke-test"],
     )
     return parser.parse_args()
 
@@ -1420,6 +1828,8 @@ def main() -> int:
             check_configuration()
         elif args.command == "smoke-test":
             print(json.dumps(native.smoke_test(), indent=2))
+        elif args.command == "queue-smoke-test":
+            print(json.dumps(queue_smoke_test(), indent=2))
     except (RuntimeError, subprocess.CalledProcessError) as error:
         LOG.error("%s", error)
         return 1

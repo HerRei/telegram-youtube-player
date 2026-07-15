@@ -56,12 +56,15 @@ Playback uses a separate profile and does not change the user's normal browser p
 
 ## Use
 
-Send a YouTube link or describe a page to find. Direct non-YouTube links are rejected.
+Send one or more YouTube links or describe a page to find. New YouTube links are added to the queue without interrupting the current video. The queue survives service restarts. Direct non-YouTube links are rejected.
 
 ```text
-/status  Show the browser and target monitor.
-/stop    Close the playback window.
-/help    Show bot help.
+/queue   Show the current video and waiting items.
+/skip    Play the next item.
+/clear   Remove waiting items but keep the current video.
+/status  Show the browser, monitor, and queue size.
+/stop    Close playback and clear the queue.
+/help    Show all commands.
 ```
 
 Source installs also support:
@@ -79,6 +82,7 @@ Configuration is kept in the current user's application-data directory. Real tok
 ```bash
 python -m unittest discover -s tests -v
 python player.py smoke-test
+python player.py queue-smoke-test
 ```
 
-CI tests the source and packaged apps on Linux, Windows, Apple Silicon macOS, and Intel macOS. Physical second-monitor playback still needs testing on the target machine.
+CI tests the source, queue server, player script, and packaged apps on Linux, Windows, Apple Silicon macOS, and Intel macOS. Physical second-monitor playback still needs testing on the target machine.

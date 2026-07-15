@@ -41,6 +41,10 @@ jobs:
           python -m py_compile player.py platform_support.py setup_ui.py link_search.py
           python -m unittest discover -s tests -v
           python player.py smoke-test
+          python player.py queue-smoke-test
+          python -c "from pathlib import Path; import player; Path('queue-player.js').write_text(player.player_script('test-token', 'http://127.0.0.1:1'), encoding='utf-8')"
+          node --check queue-player.js
+          node tests/check_player_script.js queue-player.js
 
       - name: Build setup application
         run: |
@@ -49,7 +53,9 @@ jobs:
 
       - name: Test Linux application
         if: matrix.package == 'linux'
-        run: ./dist/TelegramYouTubePlayer smoke-test
+        run: |
+          ./dist/TelegramYouTubePlayer smoke-test
+          ./dist/TelegramYouTubePlayer queue-smoke-test
 
       - name: Package Linux downloads
         if: matrix.package == 'linux'
@@ -85,8 +91,10 @@ jobs:
         if: matrix.package == 'windows'
         shell: pwsh
         run: |
-          $process = Start-Process -FilePath "dist/TelegramYouTubePlayer.exe" -ArgumentList "smoke-test" -Wait -PassThru
-          if ($process.ExitCode -ne 0) { exit $process.ExitCode }
+          foreach ($command in @("smoke-test", "queue-smoke-test")) {
+            $process = Start-Process -FilePath "dist/TelegramYouTubePlayer.exe" -ArgumentList $command -Wait -PassThru
+            if ($process.ExitCode -ne 0) { exit $process.ExitCode }
+          }
 
       - name: Package Windows download
         if: matrix.package == 'windows'
@@ -97,7 +105,9 @@ jobs:
 
       - name: Test macOS application
         if: startsWith(matrix.package, 'macos-')
-        run: ./dist/TelegramYouTubePlayer.app/Contents/MacOS/TelegramYouTubePlayer smoke-test
+        run: |
+          ./dist/TelegramYouTubePlayer.app/Contents/MacOS/TelegramYouTubePlayer smoke-test
+          ./dist/TelegramYouTubePlayer.app/Contents/MacOS/TelegramYouTubePlayer queue-smoke-test
 
       - name: Package macOS download
         if: startsWith(matrix.package, 'macos-')

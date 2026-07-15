@@ -3,7 +3,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 import urllib.parse
+import urllib.request
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -83,18 +85,25 @@ class YouTubeURLTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(expected, player.youtube_playback_url(source))
 
-    def test_local_player_supplies_origin_and_referrer_policy(self):
-        origin = "http://127.0.0.1:8765"
-        embed = player.player_embed_url("https://www.youtube.com/embed/abc123?autoplay=1", origin)
-        query = urllib.parse.parse_qs(urllib.parse.urlsplit(embed).query)
-        self.assertEqual([origin], query["origin"])
-        document = player.player_document(embed).decode()
-        self.assertIn('referrerpolicy="strict-origin-when-cross-origin"', document)
-        self.assertIn("width: 100%; height: 100%", document)
+    def test_creates_queue_items_for_videos_and_playlists(self):
+        video = player.youtube_queue_item("https://youtu.be/abc123?t=1m20s", "Example video")
+        playlist = player.youtube_queue_item("https://youtube.com/playlist?list=PL123&index=3")
+        self.assertEqual(("video", "abc123", 80), (video.kind, video.media_id, video.start_seconds))
+        self.assertEqual("Example video", video.title)
+        self.assertEqual(("playlist", "PL123", 2), (playlist.kind, playlist.media_id, playlist.index))
 
-    def test_local_player_rejects_non_youtube_content(self):
-        with self.assertRaises(ValueError):
-            player.player_embed_url("https://example.com/embed/abc", "http://127.0.0.1:8765")
+    def test_rejects_non_playable_youtube_queue_links(self):
+        with self.assertRaisesRegex(ValueError, "video or playlist"):
+            player.youtube_queue_item("https://youtube.com/@example")
+
+    def test_local_player_uses_iframe_api_and_origin(self):
+        origin = "http://127.0.0.1:8765"
+        document = player.player_document("control-token", origin).decode()
+        self.assertIn('name="referrer" content="strict-origin-when-cross-origin"', document)
+        self.assertIn("width: 100%; height: 100%", document)
+        self.assertIn("https://www.youtube.com/iframe_api", document)
+        self.assertIn(json.dumps(origin), document)
+        self.assertIn(json.dumps("control-token"), document)
 
     def test_accepts_only_public_web_search_results(self):
         accepted = (
@@ -118,6 +127,78 @@ class YouTubeURLTests(unittest.TestCase):
         for url in rejected:
             with self.subTest(url=url):
                 self.assertIsNone(player.normalize_public_url(url))
+
+
+class PlaybackQueueTests(unittest.TestCase):
+    def test_preserves_order_and_restores_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            queue = player.PlaybackQueue(path)
+            items = [
+                player.youtube_queue_item("https://youtu.be/first"),
+                player.youtube_queue_item("https://youtu.be/second"),
+                player.youtube_queue_item("https://youtu.be/third"),
+            ]
+            self.assertEqual([0, 1, 2], queue.enqueue(items))
+            self.assertEqual("first", queue.snapshot()["current"]["media_id"])
+
+            previous, current = queue.advance("wrong-token")
+            self.assertIsNone(previous)
+            self.assertEqual("first", current.media_id)
+            previous, current = queue.advance(items[0].token)
+            self.assertEqual("first", previous.media_id)
+            self.assertEqual("second", current.media_id)
+
+            restored = player.PlaybackQueue(path)
+            self.assertEqual("second", restored.snapshot()["current"]["media_id"])
+            self.assertEqual(["third"], [item["media_id"] for item in restored.snapshot()["pending"]])
+            self.assertEqual(1, restored.clear_pending())
+            restored.advance()
+            self.assertFalse(path.exists())
+
+    def test_local_api_requires_token_and_advances_once(self):
+        queue = player.PlaybackQueue(None)
+        first = player.youtube_queue_item("https://youtu.be/first")
+        second = player.youtube_queue_item("https://youtu.be/second")
+        queue.enqueue([first, second])
+        server = player.LocalPlaybackServer(queue)
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                urllib.request.urlopen(f"{server.origin}/api/queue", timeout=5)
+            self.assertEqual(403, denied.exception.code)
+
+            headers = {"X-Player-Token": server.control_token}
+            request = urllib.request.Request(f"{server.origin}/api/queue", headers=headers)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                state = json.load(response)
+            self.assertEqual("first", state["current"]["media_id"])
+
+            body = json.dumps({"token": first.token}).encode()
+            for _ in range(2):
+                request = urllib.request.Request(
+                    f"{server.origin}/api/advance",
+                    data=body,
+                    method="POST",
+                    headers={**headers, "Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    state = json.load(response)
+            self.assertEqual("second", state["current"]["media_id"])
+            self.assertEqual([], state["pending"])
+        finally:
+            server.close()
+
+    def test_queue_status_lists_current_and_pending(self):
+        queue = player.PlaybackQueue(None)
+        queue.enqueue(
+            [
+                player.youtube_queue_item("https://youtu.be/first", "First"),
+                player.youtube_queue_item("https://youtu.be/second", "Second"),
+            ]
+        )
+        status = player.queue_status_text(queue)
+        self.assertIn("Now: First", status)
+        self.assertIn("1. Second", status)
 
 
 class MonitorTests(unittest.TestCase):
@@ -452,11 +533,21 @@ class BrowserTests(unittest.TestCase):
             player.PLAYER_PID_FILE = state_dir / "browser-player.json"
             player.LEGACY_PLAYER_PID_FILE = state_dir / "firefox-player.json"
             player.PLAYER_PID_FILE.write_text(
-                json.dumps({"pid": process.pid, "window_id": 0, "profile_dir": str(old_profile)})
+                json.dumps(
+                    {
+                        "pid": process.pid,
+                        "window_id": 0,
+                        "profile_dir": str(old_profile),
+                        "url": "http://127.0.0.1/player",
+                    }
+                )
             )
             config = player.Config("test", 0, 0, browser_type="chrome", browser_path="/bin/true")
             try:
-                self.assertTrue(player.BrowserPlayer(config).stop())
+                browser = player.BrowserPlayer(config)
+                self.assertTrue(browser.is_running("http://127.0.0.1/player"))
+                self.assertFalse(browser.is_running("https://example.com"))
+                self.assertTrue(browser.stop())
                 process.wait(timeout=2)
             finally:
                 player.PLAYER_PID_FILE = original_pid_file

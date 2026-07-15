@@ -1,5 +1,9 @@
 Installers for Linux, Windows, and macOS.
 
+## Queue playback
+
+YouTube links now join a persistent queue instead of replacing the current video. The player advances automatically when a video ends. Use `/queue`, `/skip`, `/clear`, and `/stop` from Telegram. Multiple links in one message are queued in order.
+
 ## Install
 
 - **Windows x86-64:** download and run `TelegramYouTubePlayer-Setup-Windows-x86_64.exe`.
